@@ -1,0 +1,204 @@
+from django.shortcuts import render
+#from jumpssh import SSHSession
+import paramiko
+import logging
+import json
+import ipaddress
+import requests
+
+# django dependencies.
+from django.http import HttpResponse, JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.forms.models import model_to_dict
+from rest_framework.response import Response
+
+#models and serializers
+from detail.serializers  import detailsSerializer, serverinfoSerializer, errinfoSerializer
+from detail.models import details, serverinfo, errinfo
+
+#logging
+logging.basicConfig(filename="serverdetail.log",
+                    format='%(asctime)s %(message)s',
+                    filemode='w')
+
+#Creating an object
+logger=logging.getLogger()
+
+#Setting the threshold of logger to DEBUG
+logger.setLevel(logging.INFO)
+@csrf_exempt
+def detail_list(request):
+
+    if request.method == 'POST':
+        details = json.loads(request.body)
+        #validate ip
+        ip=details.get('ip')
+        if ip == '':
+            logger.info("ip is empty")
+            return JsonResponse({'message': 'ip should not be empty'}, status=400)
+        try:
+            vadidateip = ipaddress.ip_address(ip)
+        except Exception as e:
+            return JsonResponse({'message': 'Invalid IP'}, status=400)
+
+        #validate username
+        username=details.get('username')
+        if username == '':
+            return JsonResponse({'message': 'username should not be empty'}, status=400)
+        password=details.get('password')
+        #validate password
+        if password == '':
+            return JsonResponse({'message': 'password should not be empty'}, status=400)
+        arr=[]
+        serverdetail=getinfo(ip,username,password)
+        if serverdetail.status == 'false':
+            serializer= errinfoSerializer(serverdetail).data
+            arr.append(serializer)
+        else:
+            serializer= serverinfoSerializer(serverdetail).data
+            arr.append(serializer)
+
+        #serializer= serverinfoSerializer(serverdetail).data
+        #arr.append(serializer)
+        #print(arr[0].ip)
+        
+        serverdetail=getinfo('10.159.16.101','ubuntu','ubuntu')
+        serializer = serverinfoSerializer(serverdetail).data
+        arr.append(serializer)
+     
+        #serializer = serverinfoSerializer(arr[0]).data 
+        #serializer = serverinfoSerializer(arr[1]).data 
+        #print(arr[0].ip)
+        #print(arr[1].ip)
+        output = {"data": arr}
+        return JsonResponse(output,status=200,safe=False)
+        #model_to_dict(serverdetail)
+        #serializer = serverinfoSerializer(serverdetail).data
+        #return JsonResponse(serializer, status=200,safe=False)
+    else:
+        return JsonResponse({'message': 'Only Post method is supported'}, status=404)
+
+def getinfo(ip,username,password):
+    IP = ip
+    USER = username
+    PASSWORD=password
+    ssh=paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    errinfo.status="true"
+    serverinfo.status="true"
+    try:
+        #connection establishment
+        ssh.connect(hostname=IP,username=USER,password=PASSWORD,timeout=10)
+    except Exception as e:
+        if(str(e) == "timed out"):
+            e="connection error"
+        if(str(e) == "No existing session"):
+            e="Authentication Error"
+        if(str(e) == "Bad authentication type; allowed types: ['publickey', 'keyboard-interactive']"):
+            e="Authentication Error"
+        errinfo.status = "false"
+        serverinfo.status="false"
+        print(e)
+        logger.info("Exception raised when connecting to remote server and Exception is %s", e)
+        serverinfo.message = str(e)
+        ssh.close()
+        return serverinfo
+    #server ip
+    logger.info("connected to remote server")
+    serverinfo.ip = IP
+    ssh.exec_command("cd /tmp")
+    #Getting Os information
+    stdin,stdout,stderr=ssh.exec_command("cat /etc/os-release | grep '^NAME' | awk -F= '{print $2}'")
+    outlines=stdout.readlines()
+    os = ''.join(outlines)
+    os = os.rstrip()
+    serverinfo.os = os.strip('\"')
+
+    #Getting Os version information
+    stdin,stdout,stderr=ssh.exec_command("cat /etc/os-release | grep '^VERSION_ID' | awk -F= '{print $2}'")
+    outlines=stdout.readlines()
+    osversion=''.join(outlines)
+    osversion = osversion.rstrip()
+    serverinfo.osversion = osversion.strip('\"')
+    
+    #Getting Hostname of the Remote server 
+    stdin,stdout,stderr=ssh.exec_command("hostname")
+    outlines=stdout.readlines()
+    hostname =''.join(outlines)
+    serverinfo.hostname = hostname.rstrip()
+    
+    #Getting security server information
+    stdin,stdout,stderr=ssh.exec_command("dpkg -l | grep xroad-securityserver | awk '{print substr($2,0,20)}'")
+    outlines=stdout.readlines()
+    xroadcomponent=''.join(outlines)
+    xroadcomponent=xroadcomponent.rstrip()
+    if xroadcomponent == 'xroad-securityserver':
+        print(xroadcomponent)
+        serverinfo.xroadcomponent = xroadcomponent
+        stdin,stdout,stderr=ssh.exec_command("dpkg -l | grep xroad-securityserver | awk '{print substr($3,0,10)}'")
+        outlines=stdout.readlines()
+        xroadcomponentversion=''.join(outlines)
+        serverinfo.xroadcomponentversion=xroadcomponentversion.rstrip()
+        logger.info("Remote server has security server installed %s", IP)
+        return serverinfo
+    
+    #Getting central server information
+    stdin,stdout,stderr=ssh.exec_command("dpkg -l | grep xroad-centralserver-monitoring | awk '{print substr($2,0,19)}'")
+    outlines=stdout.readlines()
+    xroadcomponent=''.join(outlines)
+    xroadcomponent=xroadcomponent.rstrip()
+    if xroadcomponent == "xroad-centralserver":
+        serverinfo.xroadcomponent = xroadcomponent
+        stdin,stdout,stderr=ssh.exec_command("dpkg -l | grep xroad-centralserver-monitoring | awk '{print substr($3,0,6)}'")
+        outlines=stdout.readlines()
+        xroadcomponentversion=''.join(outlines)
+        serverinfo.xroadcomponentversion=xroadcomponentversion.rstrip()
+        logger.info("Remote server has central server installed %s", IP)
+        return serverinfo
+
+    #If no Xroad component installed
+    if (xroadcomponent != "xroad-securityserver" and xroadcomponent != "xroad-centralserver"):
+        serverinfo.xroadcomponent = "No xroad component installed"
+        serverinfo.xroadcomponentversion="-"
+        logger.info("Remote server has no xroad component installed %s", IP)
+        return serverinfo
+    ssh.close()
+
+    '''
+    gateway_session = SSHSession('10.159.16.100','ubuntu',password='ubuntu').open()
+    print("hello")
+    remote_session = gateway_session.get_remote_session(IP,USER,password=PASSWORD)
+    raise Exception('connection error')
+    print('world')
+    serverinfo.ip = IP
+    #serverinfo.os= remote_session.get_cmd_output("hostnamectl | grep Operating | awk '{print substr($3,0,7)}'")
+    remote_session.get_cmd_output("cd /tmp")
+    print(remote_session.get_cmd_output("id $USER"))
+    os= remote_session.get_cmd_output("cat /etc/os-release | grep '^NAME' | awk -F= '{print $2}'")
+    serverinfo.os = os.strip('\"')
+    #serverinfo.osversion= remote_session.get_cmd_output("hostnamectl | grep Operating | awk '{print substr($4,0,7)}'")
+    osversion= remote_session.get_cmd_output("cat /etc/os-release | grep '^VERSION_ID' | awk -F= '{print $2}'")
+    serverinfo.osversion=osversion.strip('\"')
+    serverinfo.hostname=remote_session.get_cmd_output('hostname')
+
+    xroadcomponent=remote_session.get_cmd_output("dpkg -l | grep xroad-securityserver | awk '{print substr($2,0,20)}'")
+    if xroadcomponent == "xroad-securityserver":
+        serverinfo.xroadcomponent=xroadcomponent
+        serverinfo.xroadcomponentversion=remote_session.get_cmd_output("dpkg -l | grep xroad-securityserver | awk '{print substr($3,0,9)}'")
+        return serverinfo
+
+    xroadcomponent=remote_session.get_cmd_output("dpkg -l | grep xroad-centralserver-monitoring | awk '{print substr($2,0,19)}'")
+    if xroadcomponent == "xroad-centralserver":
+        serverinfo.xroadcomponent=xroadcomponent
+        serverinfo.xroadcomponentversion=remote_session.get_cmd_output("dpkg -l | grep xroad-centralserver-monitoring | awk '{print substr($3,0,6)}'")
+        return serverinfo
+
+    if (xroadcomponent != "xroad-securityserver" and  xroadcomponent != "xroad-centralserver") :
+        print("**********")
+        serverinfo.xroadcomponent = "No xroad component installed"
+        serverinfo.xroadcomponentversion="-"
+        print(serverinfo.xroadcomponent)
+        return serverinfo
+    print(serverinfo)
+    gateway_session.close()
+'''
